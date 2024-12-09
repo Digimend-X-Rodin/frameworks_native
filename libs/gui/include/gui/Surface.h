@@ -619,11 +619,6 @@ protected:
 
         void setOnAcquiredCallback(ANativeWindow_OnAcquiredCallback onAcquiredCallback, void* data);
 
-#if COM_ANDROID_GRAPHICS_LIBGUI_FLAGS(BQ_CONSUMER_ATTACH_CALLBACK)
-        virtual void onBufferAttached() override { mSurfaceListener->onBufferAttached(); }
-
-        virtual bool needsAttachNotify() override { return mSurfaceListener->needsAttachNotify(); }
-#endif
     private:
         wp<Surface> mParent;
         sp<SurfaceListener> mSurfaceListener;
