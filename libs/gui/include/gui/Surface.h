@@ -908,8 +908,8 @@ protected:
     std::unordered_set<int> mDequeuedSlots;
 
     #ifdef ENABLE_MTK_GED_KPI
-    pid_t mPid;
-    bool mIsSurfaceFlinger;
+    pid_t mPid = -1;
+    bool mIsSurfaceFlinger = false;
     #endif
 
     // Indicates whether this surface holds the mouse cursor, and subsequently determines whether

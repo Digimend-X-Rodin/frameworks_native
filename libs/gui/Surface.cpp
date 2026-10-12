@@ -145,8 +145,8 @@ struct GED_BRIDGE_OUT_GPU_TIMESTAMP {
     int is_ged_kpi_enabled;
 };
 
-static int doMtkGedKpi = 1;
 static int ged_fd = -1;
+static std::once_flag sGedInitOnce;
 #endif
 
 Surface::ProducerDeathListenerProxy::ProducerDeathListenerProxy(
@@ -236,22 +236,15 @@ Surface::Surface(const sp<IGraphicBufferProducer>& bufferProducer, bool controll
     }
 
     #ifdef ENABLE_MTK_GED_KPI
-    if (ged_fd == -1 && doMtkGedKpi == 1) {
-        ALOGE("Opening ged");
+    std::call_once(sGedInitOnce, [] {
         ged_fd = open("/proc/ged", O_RDONLY);
-        ALOGE("Opening ged ret = %d", ged_fd);
-        {
-        struct GED_BRIDGE_IN_GPU_TIMESTAMP in = {
-            .pid = 0,
-            //.ullWnd = (uint64_t)(intptr_t)this,
-                .ullWnd = 0,
-                .i32FrameID = 0,
-            .fence_fd = 0,
-            .isSF = 0,
-            .QedBuffer_length = 0,
-        };
-        struct GED_BRIDGE_OUT_GPU_TIMESTAMP out;
-        memset(&in, 0, sizeof(in));
+        ALOGD("open /proc/ged ret = %d", ged_fd);
+        if (ged_fd < 0) {
+            ALOGW("No /proc/ged");
+            return;
+        }
+        struct GED_BRIDGE_IN_GPU_TIMESTAMP in = {};
+        struct GED_BRIDGE_OUT_GPU_TIMESTAMP out = {};
         GED_BRIDGE_PACKAGE package = {
             .ui32FunctionID = GED_BRIDGE_IO_GPU_TIMESTAMP,
             .i32Size = sizeof(GED_BRIDGE_PACKAGE),
@@ -260,18 +253,14 @@ Surface::Surface(const sp<IGraphicBufferProducer>& bufferProducer, bool controll
             .pvParamOut = &out,
             .i32OutBufferSize = sizeof(out),
         };
-        if (ged_fd >= 0) {
-            int ret = ioctl(ged_fd, GED_BRIDGE_IO_GPU_TIMESTAMP, &package);
-            ALOGE("First null timestamp ioctl returned %d %d %d", ret, out.eError, out.is_ged_kpi_enabled);
-            if (out.is_ged_kpi_enabled != 1) {
-                ALOGE("is_ged_kpi_enabled reported disabled");
-                doMtkGedKpi = 0;
-            }
-        } else {
-            ALOGE("No /proc/ged");
+        int ret = ioctl(ged_fd, GED_BRIDGE_IO_GPU_TIMESTAMP, &package);
+        ALOGD("GED probe ioctl returned %d %d %d", ret, out.eError, out.is_ged_kpi_enabled);
+        if (ret < 0 || out.is_ged_kpi_enabled != 1) {
+            ALOGD("GED KPI not available");
+            close(ged_fd);
+            ged_fd = -1;
         }
-        }
-    }
+    });
     #endif
 }
 
@@ -2564,18 +2553,15 @@ int Surface::connect(int api, const sp<SurfaceListener>& listener, bool reportBu
             : (ipc != nullptr)?ipc->getCallingPid():-1;
 
         // We've got caller PID. Now checking whether it is surfaceflinger
-        char cmdline[128];
+        char cmdline[128] = {};
         char path[128];
-        snprintf(path, sizeof(path)-1, "/proc/%d/cmdline", mPid);
+        snprintf(path, sizeof(path), "/proc/%d/cmdline", mPid);
         int fd = open(path, O_RDONLY);
-        read(fd, cmdline, sizeof(cmdline)-1);
-        // Normally cmdline is already \0-separated, but well
-        for(unsigned i=0; i<sizeof(cmdline); i++)
-            if(cmdline[i] == '\n')
-                cmdline[i] = 0;
-        cmdline[sizeof(cmdline)-1] = 0;
-
-        close(fd);
+        if (fd >= 0) {
+            ssize_t len = read(fd, cmdline, sizeof(cmdline) - 1);
+            close(fd);
+            if (len >= 0) cmdline[len] = 0;
+        }
 
         // Truncate to last / (also called basename)
         const char *c = strrchr(cmdline, '/');
@@ -2585,10 +2571,10 @@ int Surface::connect(int api, const sp<SurfaceListener>& listener, bool reportBu
             c = cmdline;
         }
         if(strcmp(c, "surfaceflinger") == 0) {
-            ALOGE("is surfaceflinger = 1");
+            ALOGD("is surfaceflinger = 1");
             mIsSurfaceFlinger = true;
         } else {
-            ALOGE("is surfaceflinger = 0");
+            ALOGD("is surfaceflinger = 0");
             mIsSurfaceFlinger = false;
         }
     }
