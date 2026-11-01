@@ -1370,15 +1370,18 @@ void SkiaRenderEngine::drawLayersInternal(
                         blurredImage =
                                 mBlurFilter->generateTemporaryImage(context, display, blurRadius,
                                                                     blurInput, blurRect);
-                        if (cacheableBlurInput) {
+                        // A failed blur returns nullptr. Only real results may be cached.
+                        if (blurredImage && cacheableBlurInput) {
                             storeBlurCache(blurredImage, blurRadius, blurRectI, blurInputHash);
                         }
                     }
                     temporaryBlurredImage = blurredImage;
 
-                    mBlurFilter->drawBlurRegion(canvas, bounds, blurRadius,
-                                                layer.backgroundBlurScale, blurScale, blurRect,
-                                                temporaryBlurredImage, blurInput);
+                    if (blurredImage) {
+                        mBlurFilter->drawBlurRegion(canvas, bounds, blurRadius,
+                                                    layer.backgroundBlurScale, blurScale, blurRect,
+                                                    temporaryBlurredImage, blurInput);
+                    }
                 }
 
                 if (layer.blurRegions.size()) {
@@ -1442,9 +1445,12 @@ void SkiaRenderEngine::drawLayersInternal(
                             blurredImage =
                                     mBlurFilter->generateTemporaryImage(context, display, radius,
                                                                         blurInput, blurRect);
-                            if (cacheableBlurInput) {
+                            if (blurredImage && cacheableBlurInput) {
                                 storeBlurCache(blurredImage, radius, blurRectI, blurInputHash);
                             }
+                        }
+                        if (!blurredImage) {
+                            continue;
                         }
                         for (const BlurRegion& region : regions) {
                             drawRegion(blurredImage, radius, region);

@@ -285,7 +285,7 @@ sk_sp<SkImage> GlassBlurFilter::generate(SkiaGpuContext* context, const uint32_t
     }
     const uint32_t effRadius = effectiveRadius(blurRadius);
     if (effRadius == 0 || blurRect.isEmpty()) {
-        return input;
+        return nullptr;
     }
     ++mFrameCounter;
     const float scale = mInputScale;
@@ -322,7 +322,7 @@ sk_sp<SkImage> GlassBlurFilter::generate(SkiaGpuContext* context, const uint32_t
     for (int i = 0; i <= filterPasses; i++) {
         surfaces[i] = makeSurface(i);
         if (!surfaces[i]) {
-            return input;
+            return nullptr;
         }
     }
 
@@ -340,7 +340,7 @@ sk_sp<SkImage> GlassBlurFilter::generate(SkiaGpuContext* context, const uint32_t
     for (int i = 0; i < filterPasses; i++) {
         sk_sp<SkImage> tempImg = surfaces[i]->makeTemporaryImage();
         if (!tempImg) {
-            return input;
+            return nullptr;
         }
         blurInto(surfaces[i + 1],
                  tempImg->makeShader(SkTileMode::kClamp, SkTileMode::kClamp,
@@ -359,14 +359,16 @@ sk_sp<SkImage> GlassBlurFilter::generate(SkiaGpuContext* context, const uint32_t
 
     for (int i = filterPasses - 1; i >= 0; i--) {
         sk_sp<SkImage> tempImg = surfaces[i + 1]->makeTemporaryImage();
-        if (!tempImg) return input;
+        if (!tempImg) return nullptr;
         const float alpha = std::min(1.0f, filterDepth - i);
         const auto& u = (i % 2 == 0) ? mLastUniformsAxis : mLastUniformsDiag;
         blurInto(surfaces[i], tempImg->makeShader(SkTileMode::kClamp, SkTileMode::kClamp, kLinearSampling, kUpscaleMatrix), u, alpha, mUpSampleBlurEffect);
     }
 
-    sk_sp<SkImage> result = surfaces[0]->makeTemporaryImage();
-    return result ? result : input;
+    // Return an owned copy-on-write snapshot, not a temporary image. The pooled surface may be
+    // written again by later blurs (including the next frame), and a cached result must not
+    // observe those writes.
+    return surfaces[0]->makeImageSnapshot();
 }
 
 } // namespace skia
