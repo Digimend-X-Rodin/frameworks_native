@@ -275,12 +275,22 @@ static bool stackedBlurEnabled() {
     return sEnabled;
 }
 
-static inline bool isBlurCoveringMostOfScreen(const android::renderengine::LayerSettings& layer,
-                                             const android::renderengine::DisplaySettings& display) {
+// Returns true only if the layer is a fully opaque, square-cornered blur layer covering most of the
+// screen. Only an opaque layer hides what is behind it. A translucent blur panel shows the blurred
+// content below it, so the blur under it is still visible and must not be reduced.
+static inline bool isOpaqueFullScreenOccluder(const android::renderengine::LayerSettings& layer,
+                                              const android::renderengine::DisplaySettings& display) {
     if (layer.backgroundBlurRadius <= 0) {
         return false;
     }
-    if (layer.alpha < 0.5f) {
+    if (layer.alpha < 1.0f || layer.skipContentDraw) {
+        return false;
+    }
+    const bool opaqueContent = !layer.source.buffer.buffer || layer.source.buffer.isOpaque;
+    if (!opaqueContent) {
+        return false;
+    }
+    if (!layer.geometry.roundedCornersRadii.isEmpty()) {
         return false;
     }
     const float layerW = layer.geometry.boundaries.getWidth();
@@ -1196,7 +1206,7 @@ void SkiaRenderEngine::drawLayersInternal(
                     if (isLayerFullyTransparent(*higherLayer)) {
                         continue;
                     }
-                    if (isBlurCoveringMostOfScreen(*higherLayer, display)) {
+                    if (isOpaqueFullScreenOccluder(*higherLayer, display)) {
                         higherBlurRadius = std::max(higherBlurRadius,
                                 static_cast<float>(higherLayer->backgroundBlurRadius));
                     }
