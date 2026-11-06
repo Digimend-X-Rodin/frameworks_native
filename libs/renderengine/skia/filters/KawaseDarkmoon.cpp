@@ -229,6 +229,183 @@ void KawaseDarkmoon::blurInto(const sk_sp<SkSurface>& drawSurface, SkISize drawC
     canvas->drawPaint(paint);
 }
 
+// The downsampled levels of one blur input. They depend only on the input and the rectangle, never on
+// the blur radius, so the blurs of one layer can share them. Each radius then runs only its upsample
+// passes. The levels live in mSharedDownCache, which holds one prepared input at a time. The layer blur
+// block prepares one, uses it for all of its blurs, and drops it before the next layer.
+class KawaseDarkmoon::PreparedInput : public BlurFilter::PreparedBlurInput {
+public:
+    PreparedInput(const KawaseDarkmoon* filter, SkiaGpuContext* context,
+                  const DisplaySettings& display, const sk_sp<SkImage>& input,
+                  const SkRect& blurRect, uint64_t generation)
+          : mFilter(filter), mContext(context), mInput(input), mGeneration(generation) {
+        SkIRect targetBlurRect;
+        blurRect.roundIn(&targetBlurRect);
+        mBlurRect = blurRect;
+        mInputClamp = SkRect::Make(targetBlurRect);
+        mFullRes = targetBlurRect.size();
+        mDisplaySize = SkISize::Make(display.physicalDisplay.width(), display.physicalDisplay.height());
+        mHintFromDisplay = !mDisplaySize.isEmpty();
+        mBaseInfo = input->imageInfo();
+        for (int i = 0; i < kMaxSurfaces; i++) {
+            mContentSizes[i] = levelSize(mFullRes, i);
+        }
+    }
+
+    SkiaGpuContext* context() const { return mContext; }
+    const sk_sp<SkImage>& input() const { return mInput; }
+    const SkImageInfo& baseInfo() const { return mBaseInfo; }
+    SkISize contentSize(int i) const { return mContentSizes[i]; }
+    const sk_sp<SkSurface>& level(int i) const { return mFilter->mSharedDownCache.surfaces[i]; }
+
+    SkISize preferredSize(int i) const {
+        SkISize preferred = mContentSizes[i];
+        if (mHintFromDisplay) {
+            const SkISize displayLevel = levelSize(mDisplaySize, i);
+            preferred.fWidth = std::max(preferred.width(), displayLevel.width());
+            preferred.fHeight = std::max(preferred.height(), displayLevel.height());
+        }
+        return preferred;
+    }
+
+    // Makes levels 0..depth available. Returns false if a target could not be created, or if another
+    // layer has taken the shared levels since this input was prepared.
+    bool ensureLevels(int depth) {
+        if (mFilter->mChainGeneration != mGeneration) {
+            return false;
+        }
+        for (; mComputedLevels <= depth; mComputedLevels++) {
+            const int i = mComputedLevels;
+            if (!mFilter->ensureSurface(mFilter->mSharedDownCache, i, mContext, mBaseInfo,
+                                        mContentSizes[i], preferredSize(i))) {
+                return false;
+            }
+            if (i == 0) {
+                // Skia's local matrix maps shader space -> destination, hence translate-then-scale.
+                SkMatrix blurMatrix = SkMatrix::Translate(-mBlurRect.fLeft, -mBlurRect.fTop);
+                blurMatrix.postScale(kInputScale, kInputScale);
+                mFilter->blurInto(mFilter->mSharedDownCache.surfaces[0], mContentSizes[0],
+                                  mInput->makeShader(SkTileMode::kClamp, SkTileMode::kClamp,
+                                                     kLinearSampling),
+                                  &mInputClamp, blurMatrix, 0, 1.0f,
+                                  mFilter->mQuarterResDownSampleBlurEffect);
+            } else {
+                const SkISize src = mContentSizes[i - 1];
+                const SkISize dst = mContentSizes[i];
+                const SkMatrix toDest =
+                        SkMatrix::Scale(static_cast<float>(dst.width()) / src.width(),
+                                        static_cast<float>(dst.height()) / src.height());
+                const SkRect srcClamp = SkRect::Make(src);
+                const sk_sp<SkSurface>& prev = mFilter->mSharedDownCache.surfaces[i - 1];
+                const bool clampSrc = isOversized(prev, src);
+                mFilter->blurInto(mFilter->mSharedDownCache.surfaces[i], dst,
+                                  prev->makeTemporaryImage()->makeShader(
+                                          SkTileMode::kClamp, SkTileMode::kClamp, kLinearSampling),
+                                  clampSrc ? &srcClamp : nullptr, toDest, 0, 1.0f,
+                                  mFilter->mHalfResDownSampleBlurEffect);
+            }
+        }
+        return true;
+    }
+
+private:
+    const KawaseDarkmoon* mFilter;
+    SkiaGpuContext* mContext;
+    sk_sp<SkImage> mInput;
+    uint64_t mGeneration;
+    SkRect mBlurRect;
+    SkRect mInputClamp;
+    SkISize mFullRes = SkISize::MakeEmpty();
+    SkISize mDisplaySize = SkISize::MakeEmpty();
+    bool mHintFromDisplay = false;
+    SkImageInfo mBaseInfo;
+    SkISize mContentSizes[kMaxSurfaces];
+    int mComputedLevels = 0;
+};
+
+std::unique_ptr<BlurFilter::PreparedBlurInput> KawaseDarkmoon::prepareBlurInput(
+        SkiaGpuContext* context, const DisplaySettings& display, const sk_sp<SkImage>& input,
+        const SkRect& blurRect) const {
+    // Protected content takes the transient path, so it cannot share levels.
+    if (!context || !input || context->supportsProtectedContent()) {
+        return nullptr;
+    }
+    if (mSharedDownCache.context != context) {
+        mSharedDownCache.reset();
+        mSharedDownCache.context = context;
+    }
+    if (mSharedUpCache.context != context) {
+        mSharedUpCache.reset();
+        mSharedUpCache.context = context;
+    }
+    const uint64_t generation = ++mChainGeneration;
+    return std::make_unique<PreparedInput>(this, context, display, input, blurRect, generation);
+}
+
+sk_sp<SkImage> KawaseDarkmoon::generateFromPreparedInput(BlurFilter::PreparedBlurInput& prepared,
+                                                         uint32_t blurRadius) const {
+    SFTRACE_CALL();
+    PreparedInput& p = static_cast<PreparedInput&>(prepared);
+    if (blurRadius == 0) {
+        return p.input();
+    }
+
+    // Same radius and pass arithmetic as generateTemporaryImage, so the result is identical.
+    const float radius = blurRadius * kBlurSigmaScale;
+    const float filterDepth = std::min(kMaxSurfaces - 1.0f, radius * kInputScale / 2.5f);
+    const int filterPasses = std::min(kMaxSurfaces - 1, static_cast<int>(std::ceil(filterDepth)));
+    if (!p.ensureLevels(filterPasses)) {
+        return nullptr;
+    }
+    if (filterPasses == 0) {
+        return p.level(0)->makeTemporaryImage();
+    }
+    float sumSquaredR = 0;
+    float sumSquaredStep = 0;
+    for (int i = 0; i < filterPasses; i++) {
+        const float alpha = std::min(1.0f, filterDepth - i);
+        sumSquaredR += powf(powf(2.0f, i - 1) * alpha * static_cast<float>(M_SQRT2), 2.0f);
+        sumSquaredStep += powf(powf(2.0f, i) * alpha, 2.0f);
+    }
+    const float step = kDiagonalKernelCompensation *
+            sqrtf(std::max(0.0f, powf(radius * kInputScale, 2.0f) - sumSquaredR) /
+                  (sumSquaredStep == 0 ? 1.0f : sumSquaredStep));
+
+
+    // Upsample targets have their own cache, so they never overwrite a shared level.
+    for (int i = 0; i < filterPasses; i++) {
+        if (!ensureSurface(mSharedUpCache, i, p.context(), p.baseInfo(), p.contentSize(i),
+                           p.preferredSize(i))) {
+            return nullptr;
+        }
+    }
+    const sk_sp<SkSurface>* up = mSharedUpCache.surfaces;
+    for (int i = filterPasses - 1; i >= 0; i--) {
+        const SkISize src = p.contentSize(i + 1);
+        const SkISize dst = p.contentSize(i);
+        const SkMatrix toDest = SkMatrix::Scale(static_cast<float>(dst.width()) / src.width(),
+                                                static_cast<float>(dst.height()) / src.height());
+        const SkRect srcClamp = SkRect::Make(src);
+        const sk_sp<SkSurface>& srcSurface = (i + 1 == filterPasses) ? p.level(i + 1) : up[i + 1];
+        const bool clampSrc = isOversized(srcSurface, src);
+        const float alpha = std::min(1.0f, filterDepth - i);
+        if (alpha < 1.0f) {
+            // A partial pass blends with what its target already holds, which must be level i, as in
+            // generateTemporaryImage. The shared upsample target holds an earlier blur's result, so copy
+            // level i into it first.
+            SkPaint copy;
+            copy.setBlendMode(SkBlendMode::kSrc);
+            up[i]->getCanvas()->drawImage(p.level(i)->makeTemporaryImage(), 0, 0,
+                                          SkSamplingOptions(), &copy);
+        }
+        blurInto(up[i], dst,
+                 srcSurface->makeTemporaryImage()->makeShader(SkTileMode::kClamp,
+                                                              SkTileMode::kClamp, kLinearSampling),
+                 clampSrc ? &srcClamp : nullptr, toDest, step, alpha, mUpSampleBlurEffect);
+    }
+    return up[0]->makeTemporaryImage();
+}
+
 sk_sp<SkImage> KawaseDarkmoon::generateTemporaryImage(SkiaGpuContext* context,
                                                       const DisplaySettings& display,
                                                       const uint32_t blurRadius,

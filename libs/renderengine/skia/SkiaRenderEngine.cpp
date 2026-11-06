@@ -1159,16 +1159,25 @@ void SkiaRenderEngine::drawLayersInternal(
                     }
                 }
 
+                // The blurs of this layer share one input. A filter that supports it computes the
+                // downsampling once for all of them.
+                std::unique_ptr<BlurFilter::PreparedBlurInput> preparedInput =
+                        mBlurFilter->prepareBlurInput(context, display, blurInput, blurRect);
+                auto generateBlur = [&](uint32_t radius) -> sk_sp<SkImage> {
+                    if (preparedInput) {
+                        return mBlurFilter->generateFromPreparedInput(*preparedInput, radius);
+                    }
+                    return mBlurFilter->generateTemporaryImage(context, display, radius, blurInput,
+                                                               blurRect);
+                };
+
                 sk_sp<SkImage> temporaryBlurredImage = nullptr; // Might be reused by blur regions.
                 if (layer.backgroundBlurRadius > 0) {
                     SFTRACE_NAME("BackgroundBlur");
                     // Result is only valid until the next call to generateTemporaryImage (for a
                     // given BlurFilter). Safe to invalidate after all desired drawBlurRegion
                     // invocations have been made for a particular blurred SkImage.
-                    temporaryBlurredImage =
-                            mBlurFilter->generateTemporaryImage(context, display,
-                                                                layer.backgroundBlurRadius,
-                                                                blurInput, blurRect);
+                    temporaryBlurredImage = generateBlur(layer.backgroundBlurRadius);
 
                     mBlurFilter->drawBlurRegion(canvas, bounds, layer.backgroundBlurRadius,
                                                 layer.backgroundBlurScale, 1.0f, blurRect,
@@ -1218,9 +1227,7 @@ void SkiaRenderEngine::drawLayersInternal(
                     for (const auto& [radius, regions] : regionsPerRadius) {
                         {
                             SFTRACE_NAME("BlurRegion");
-                            temporaryBlurredImage =
-                                    mBlurFilter->generateTemporaryImage(context, display, radius,
-                                                                        blurInput, blurRect);
+                            temporaryBlurredImage = generateBlur(radius);
                         }
                         for (const BlurRegion& region : regions) {
                             drawRegion(temporaryBlurredImage, region);

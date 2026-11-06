@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include <memory>
+
 #include <SkCanvas.h>
 #include <SkImage.h>
 #include <SkMatrix.h>
@@ -67,6 +69,23 @@ public:
                                 sk_sp<SkImage> blurredImage, sk_sp<SkImage> input);
 
     float getMaxCrossFadeRadius() const;
+
+    // Lets the blurs of one layer share the work they have in common. A filter that cannot share
+    // returns nullptr, and the caller then uses generateTemporaryImage as before.
+    class PreparedBlurInput {
+    public:
+        virtual ~PreparedBlurInput() {}
+    };
+    virtual std::unique_ptr<PreparedBlurInput> prepareBlurInput(SkiaGpuContext* context,
+                                                                const DisplaySettings& display,
+                                                                const sk_sp<SkImage>& input,
+                                                                const SkRect& blurRect) const {
+        return nullptr;
+    }
+    virtual sk_sp<SkImage> generateFromPreparedInput(PreparedBlurInput& prepared,
+                                                     uint32_t blurRadius) const {
+        return nullptr;
+    }
 
     virtual void preallocateBuffers(SkiaGpuContext* context, ui::Size size) {}
     virtual bool areBuffersPreallocated(const SkiaGpuContext* context, ui::Size displaySize) const {

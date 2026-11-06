@@ -60,6 +60,13 @@ public:
                                           const uint32_t radius, const sk_sp<SkImage> blurInput,
                                           const SkRect& blurRect) const override;
 
+    std::unique_ptr<PreparedBlurInput> prepareBlurInput(SkiaGpuContext* context,
+                                                        const DisplaySettings& display,
+                                                        const sk_sp<SkImage>& input,
+                                                        const SkRect& blurRect) const override;
+    sk_sp<SkImage> generateFromPreparedInput(PreparedBlurInput& prepared,
+                                             uint32_t blurRadius) const override;
+
 private:
     sk_sp<SkShader> makeBlurShader(const sk_sp<SkImage>& blurredImage, const SkMatrix& blurMatrix,
                                    const SkRect& blurRect) const override;
@@ -81,6 +88,13 @@ private:
     sk_sp<SkRuntimeEffect> mUpSampleBlurEffect;
 
     mutable SurfaceCache mUnprotectedCache;
+
+    // Levels shared by the blurs of one layer. Only one prepared input is in use at a time, so they
+    // are owned by the filter and identified by a generation.
+    class PreparedInput;
+    mutable SurfaceCache mSharedDownCache;
+    mutable SurfaceCache mSharedUpCache;
+    mutable uint64_t mChainGeneration = 0;
 
     bool ensureSurface(SurfaceCache& cache, int index, SkiaGpuContext* context,
                        const SkImageInfo& info, SkISize required, SkISize preferred) const;
