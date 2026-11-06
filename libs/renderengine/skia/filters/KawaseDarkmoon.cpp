@@ -216,7 +216,14 @@ void KawaseDarkmoon::blurInto(const sk_sp<SkSurface>& drawSurface, SkISize drawC
 
     SkCanvas* canvas = drawSurface->getCanvas();
     SkAutoCanvasRestore autoRestore(canvas, true);
-    if (isOversized(drawSurface, drawContent)) {
+    const bool oversized = isOversized(drawSurface, drawContent);
+    if (alpha == 1.0f && !oversized) {
+        // The kSrc draw overwrites every pixel, so the old contents are not needed. Discarding first
+        // avoids loading them, which costs DRAM bandwidth on tile-based GPUs. Not done when the draw is
+        // clipped, since pixels outside the clip keep their contents.
+        canvas->discard();
+    }
+    if (oversized) {
         canvas->clipRect(SkRect::Make(drawContent));
     }
     canvas->drawPaint(paint);
