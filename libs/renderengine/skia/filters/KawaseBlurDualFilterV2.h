@@ -55,6 +55,13 @@ public:
                                           const SkRect& blurRect) const override;
 
     bool areBuffersPreallocated(const SkiaGpuContext* context, ui::Size displaySize) const override;
+
+    std::unique_ptr<PreparedBlurInput> prepareBlurInput(SkiaGpuContext* context,
+                                                        const DisplaySettings& display,
+                                                        const sk_sp<SkImage>& input,
+                                                        const SkRect& blurRect) const override;
+    sk_sp<SkImage> generateFromPreparedInput(PreparedBlurInput& prepared,
+                                             uint32_t blurRadius) const override;
     // Note: the buffer preallocation code path is never enabled for the unprotected context on
     // GaneshGL due to performance reasons (nuance around texture copying logic for wrapped AHBs).
     // It can be enabled for the protected context on GaneshGL for memory savings, as protected
@@ -77,6 +84,13 @@ private:
     mutable std::mutex mRenderingMutex;
     std::shared_ptr<AutoBackendTexture::LocalRef> mUnprotectedTextures[kMaxSurfaces];
     std::shared_ptr<AutoBackendTexture::LocalRef> mProtectedTextures[kMaxSurfaces];
+
+    // Upsample targets for blurs that share a layer's downsample chain. A second preallocated set, so
+    // an upsample pass never overwrites a level that another radius still needs.
+    std::shared_ptr<AutoBackendTexture::LocalRef> mUnprotectedUpTextures[kMaxSurfaces];
+    std::shared_ptr<AutoBackendTexture::LocalRef> mProtectedUpTextures[kMaxSurfaces];
+    class PreparedInput;
+    mutable uint64_t mChainGeneration = 0;
     ui::Size mUnprotectedDisplaySize;
     ui::Size mProtectedDisplaySize;
 

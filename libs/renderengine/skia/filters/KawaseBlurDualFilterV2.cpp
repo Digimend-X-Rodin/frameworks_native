@@ -201,6 +201,150 @@ void KawaseBlurDualFilterV2::blurInto(const sk_sp<SkSurface>& drawSurface, sk_sp
     canvas->drawPaint(paint);
 }
 
+// The downsample levels of one blur input, in the preallocated set. They depend only on the input and the
+// rectangle, never on the radius, so the blurs of one layer share them. Each radius runs only its upsample
+// passes, into the second preallocated set. Only one prepared input is in use at a time, so the layer blur
+// block drops it before the next layer; a generation check fails safely if it has been overtaken.
+class KawaseBlurDualFilterV2::PreparedInput : public BlurFilter::PreparedBlurInput {
+public:
+    PreparedInput(const KawaseBlurDualFilterV2* filter, const DisplaySettings& display,
+                  const sk_sp<SkImage>& input, const SkRect& blurRect, uint64_t generation,
+                  bool isProtected)
+          : mFilter(filter), mInput(input), mBlurRect(blurRect),
+            mGeneration(generation), mDataspace(display.outputDataspace),
+            mDownTextures(isProtected ? filter->mProtectedTextures : filter->mUnprotectedTextures),
+            mUpTextures(isProtected ? filter->mProtectedUpTextures
+                                    : filter->mUnprotectedUpTextures) {
+        blurRect.roundIn(&mTargetBlurRect);
+        for (int i = 0; i < kMaxSurfaces; i++) {
+            const int newW = std::max(1, static_cast<int>(static_cast<float>(mTargetBlurRect.width()) / kScales[i]));
+            const int newH = std::max(1, static_cast<int>(static_cast<float>(mTargetBlurRect.height()) / kScales[i]));
+            mInfos[i] = input->imageInfo().makeWH(newW, newH);
+        }
+    }
+
+    const sk_sp<SkSurface>& level(int i) const { return mLevels[i]; }
+    const SkImageInfo& info(int i) const { return mInfos[i]; }
+    sk_sp<SkSurface> upTarget(int i) const { return mUpTextures[i]->getOrCreateSurface(mDataspace); }
+
+    // Makes levels 0..depth available. Returns false if a target is missing or the levels were taken by
+    // another prepared input.
+    bool ensureLevels(int depth) {
+        if (mFilter->mChainGeneration != mGeneration) {
+            return false;
+        }
+        for (; mComputed <= depth; mComputed++) {
+            const int i = mComputed;
+            mLevels[i] = mDownTextures[i]->getOrCreateSurface(mDataspace);
+            if (!mLevels[i]) {
+                return false;
+            }
+            if (i == 0) {
+                SkMatrix blurMatrix = SkMatrix::Translate(-mBlurRect.fLeft, -mBlurRect.fTop);
+                blurMatrix.postScale(kInputScale, kInputScale);
+                const auto sourceShader =
+                        mInput->makeShader(SkTileMode::kClamp, SkTileMode::kClamp,
+                                           SkSamplingOptions(SkFilterMode::kLinear, SkMipmapMode::kNone));
+                mFilter->blurInto(mLevels[0], std::move(sourceShader), mTargetBlurRect, blurMatrix,
+                                  true, 0, 1.0f, mFilter->mQuarterResDownSampleBlurEffect);
+            } else {
+                mFilter->blurInto(mLevels[i], mInfos[i].width(), mLevels[i - 1]->makeTemporaryImage(),
+                                  mInfos[i - 1].bounds(), true, 0, 1.0f,
+                                  mFilter->mHalfResDownSampleBlurEffect);
+            }
+        }
+        return true;
+    }
+
+private:
+    const KawaseBlurDualFilterV2* mFilter;
+    sk_sp<SkImage> mInput;
+    SkRect mBlurRect;
+    uint64_t mGeneration;
+    decltype(DisplaySettings::outputDataspace) mDataspace;
+    const std::shared_ptr<AutoBackendTexture::LocalRef>* mDownTextures;
+    const std::shared_ptr<AutoBackendTexture::LocalRef>* mUpTextures;
+    SkIRect mTargetBlurRect;
+    SkImageInfo mInfos[kMaxSurfaces];
+    sk_sp<SkSurface> mLevels[kMaxSurfaces];
+    int mComputed = 0;
+};
+
+std::unique_ptr<BlurFilter::PreparedBlurInput> KawaseBlurDualFilterV2::prepareBlurInput(
+        SkiaGpuContext* context, const DisplaySettings& display, const sk_sp<SkImage>& input,
+        const SkRect& blurRect) const {
+    if (!context || !input) {
+        return nullptr;
+    }
+    const bool isProtected = context->supportsProtectedContent();
+    const bool usesPreallocatedTextures =
+            FlagManager::getInstance().window_blur_kawase2_preallocate_buffers() &&
+            (isProtected ||
+             context->getBackend_onlyUseForCriticalWorkarounds() ==
+                     RenderEngine::SkiaBackend::Graphite);
+    // Only preallocated targets are shared. The other path allocates per pass, as before.
+    if (!usesPreallocatedTextures) {
+        return nullptr;
+    }
+    const auto& upTextures = isProtected ? mProtectedUpTextures : mUnprotectedUpTextures;
+    if (upTextures[0] == nullptr) {
+        return nullptr;
+    }
+    const uint64_t generation = ++mChainGeneration;
+    return std::make_unique<PreparedInput>(this, display, input, blurRect, generation, isProtected);
+}
+
+sk_sp<SkImage> KawaseBlurDualFilterV2::generateFromPreparedInput(
+        BlurFilter::PreparedBlurInput& prepared, uint32_t blurRadius) const {
+    PreparedInput& p = static_cast<PreparedInput&>(prepared);
+
+    // Same radius and pass arithmetic as generateTemporaryImage, so the result is identical.
+    const float radius = blurRadius * 0.57735f;
+    const float filterDepth = std::min(kMaxSurfaces - 1.0f, radius * kInputScale / 2.5f);
+    const int filterPasses = std::min(kMaxSurfaces - 1, static_cast<int>(ceil(filterDepth)));
+    if (!p.ensureLevels(filterPasses)) {
+        return nullptr;
+    }
+    if (filterPasses == 0) {
+        return p.level(0)->makeTemporaryImage();
+    }
+    float sumSquaredR = 0;
+    float sumSquaredStep = 0;
+    for (int i = 0; i < filterPasses; i++) {
+        const float alpha = std::min(1.0f, filterDepth - i);
+        sumSquaredR += powf(powf(2.0f, i - 1) * alpha * M_SQRT2, 2.0f);
+        sumSquaredStep += powf(powf(2.0f, i) * alpha, 2.0f);
+    }
+    // Solve for R = sqrt(sum(r_i^2)).
+    float step = sqrt(max(0.0f, powf(radius * kInputScale, 2) - sumSquaredR) /
+                      (sumSquaredStep == 0 ? 1 : sumSquaredStep));
+
+
+    sk_sp<SkSurface> up[kMaxSurfaces];
+    for (int i = 0; i < filterPasses; i++) {
+        up[i] = p.upTarget(i);
+        if (!up[i]) {
+            return nullptr;
+        }
+    }
+    for (int i = filterPasses - 1; i >= 0; i--) {
+        const sk_sp<SkSurface>& source = (i + 1 == filterPasses) ? p.level(i + 1) : up[i + 1];
+        const float alpha = std::min(1.0f, filterDepth - i);
+        if (alpha < 1.0f) {
+            // A partial pass blends with what its target already holds, which must be level i, as in
+            // generateTemporaryImage. The shared upsample target holds an earlier blur's result, so copy
+            // level i into it first.
+            SkPaint copy;
+            copy.setBlendMode(SkBlendMode::kSrc);
+            up[i]->getCanvas()->drawImage(p.level(i)->makeTemporaryImage(), 0, 0,
+                                          SkSamplingOptions(), &copy);
+        }
+        blurInto(up[i], p.info(i).width(), source->makeTemporaryImage(), p.info(i + 1).bounds(),
+                 true, step, alpha, mUpSampleBlurEffect);
+    }
+    return up[0]->makeTemporaryImage();
+}
+
 sk_sp<SkImage> KawaseBlurDualFilterV2::generateTemporaryImage(SkiaGpuContext* context,
                                                               const DisplaySettings& display,
                                                               const uint32_t blurRadius,
@@ -320,7 +464,8 @@ bool KawaseBlurDualFilterV2::areBuffersPreallocated(const SkiaGpuContext* contex
     }
 
     const auto& preallocatedTextures = isProtected ? mProtectedTextures : mUnprotectedTextures;
-    if (preallocatedTextures[0] == nullptr) {
+    const auto& upTextures = isProtected ? mProtectedUpTextures : mUnprotectedUpTextures;
+    if (preallocatedTextures[0] == nullptr || upTextures[0] == nullptr) {
         return false;
     }
 
@@ -341,6 +486,7 @@ void KawaseBlurDualFilterV2::preallocateBuffers(SkiaGpuContext* context, ui::Siz
     }
 
     auto& texturesRef = isProtected ? mProtectedTextures : mUnprotectedTextures;
+    auto& upTexturesRef = isProtected ? mProtectedUpTextures : mUnprotectedUpTextures;
     ui::Size& displaySizeRef = isProtected ? mProtectedDisplaySize : mUnprotectedDisplaySize;
     const uint64_t usageFlags = isProtected ? kProtectedUsageFlags : kUnprotectedUsageFlags;
     // Use the longer side as the ref size for the preallocated square, so that it can handle
@@ -367,6 +513,17 @@ void KawaseBlurDualFilterV2::preallocateBuffers(SkiaGpuContext* context, ui::Siz
                 context->makeBackendTexture(buffer->toAHardwareBuffer(), true);
         texturesRef[i] = std::make_shared<AutoBackendTexture::LocalRef>(std::move(backendTexture),
                                                                         mTextureCleanupMgr);
+        totalBytes += newW * newH * bytesPerPixel(PIXEL_FORMAT_RGBA_8888);
+
+        // Second set for the upsample targets of shared-chain blurs, allocated up front like the first.
+        sp<GraphicBuffer> upBuffer = sp<GraphicBuffer>::make(newW, newH, PIXEL_FORMAT_RGBA_8888, 1,
+                                                             usageFlags, "KawaseBlurDualFilterV2Up");
+        LOG_ALWAYS_FATAL_IF(upBuffer->initCheck() != OK,
+                            "Failed to preallocate upsample GraphicBuffer %d (%dx%d)", i, newW, newH);
+        std::unique_ptr<SkiaBackendTexture> upBackendTexture =
+                context->makeBackendTexture(upBuffer->toAHardwareBuffer(), true);
+        upTexturesRef[i] = std::make_shared<AutoBackendTexture::LocalRef>(std::move(upBackendTexture),
+                                                                          mTextureCleanupMgr);
         totalBytes += newW * newH * bytesPerPixel(PIXEL_FORMAT_RGBA_8888);
     }
     ALOGD("(Re)allocated %zu bytes of %s memory for intermediate blur surfaces (%dx%d display)",
