@@ -33,6 +33,7 @@
 #include <renderengine/RenderEngine.h>
 #include <sys/types.h>
 
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -247,6 +248,16 @@ private:
 
     sp<Fence> mLastDrawFence;
     BlurFilter* mBlurFilter = nullptr;
+
+    // Blur results reused across frames. Keyed on the input hash and the blur parameters.
+    struct BlurCacheEntry {
+        sk_sp<SkImage> image;
+        uint64_t inputHash;
+        uint32_t blurRadius;
+        SkIRect blurRect;
+    };
+    static constexpr size_t kBlurCacheMaxEntries = 4;
+    std::deque<BlurCacheEntry> mBlurCache;
     // Offscreen layer for blurs below the max cross-fade radius, reused across frames.
     sk_sp<SkSurface> mCompositionLayerSurface;
 

@@ -66,6 +66,9 @@ struct Buffer {
     // ignored.
     std::shared_ptr<ExternalTexture> buffer = nullptr;
 
+    // Frame number of the buffer. Identifies its content, so a blur cache can tell frames apart.
+    uint64_t frameNumber = 0;
+
     // Fence that will fire when the buffer is ready to be bound.
     sp<Fence> fence = nullptr;
 
@@ -201,7 +204,8 @@ struct LayerSettings {
 // Keep in sync with custom comparison function in
 // compositionengine/impl/ClientCompositionRequestCache.cpp
 static inline bool operator==(const Buffer& lhs, const Buffer& rhs) {
-    return lhs.buffer == rhs.buffer && lhs.fence == rhs.fence &&
+    return lhs.buffer == rhs.buffer && lhs.frameNumber == rhs.frameNumber &&
+            lhs.fence == rhs.fence &&
             lhs.useTextureFiltering == rhs.useTextureFiltering &&
             lhs.textureTransform == rhs.textureTransform &&
             lhs.usePremultipliedAlpha == rhs.usePremultipliedAlpha &&

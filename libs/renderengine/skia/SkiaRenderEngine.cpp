@@ -78,6 +78,8 @@
 #include <deque>
 #include <memory>
 #include <numeric>
+#include <cstring>
+#include <utility>
 
 #include <renderengine/ColorSpaces.h>
 #include "Cache.h"
@@ -254,6 +256,48 @@ static inline std::pair<SkRRect, SkRRect> getBoundsAndClip(
     return {SkRRect::MakeRect(bounds), clip};
 }
 
+// True when the blur of `layer` cannot be seen in the output, so skipping it leaves the image
+// unchanged. An opaque layer above it must cover its whole bounds, with the same transform, square
+// corners, no shadow and no colour transform. No layer between them may have a blur of its own,
+// because a blur samples the content below it. Scanning stops at the first opaque cover.
+static bool isBlurOccludedByOpaqueLayer(const android::renderengine::LayerSettings& layer,
+                                        const std::vector<android::renderengine::LayerSettings>& layers,
+                                        bool ctModifiesAlpha) {
+    if (ctModifiesAlpha) {
+        return false;
+    }
+    const size_t index = static_cast<size_t>(&layer - layers.data());
+    const auto& b = layer.geometry.boundaries;
+    auto covers = [](const auto& outer, const auto& inner) {
+        return outer.left <= inner.left && outer.top <= inner.top && outer.right >= inner.right &&
+                outer.bottom >= inner.bottom;
+    };
+    for (size_t j = index + 1; j < layers.size(); ++j) {
+        const auto& above = layers[j];
+        if (above.backgroundBlurRadius > 0 || !above.blurRegions.empty()) {
+            return false;
+        }
+        if (above.alpha < 1.0f || above.skipContentDraw) {
+            continue;
+        }
+        if (above.source.buffer.buffer && !above.source.buffer.isOpaque) {
+            continue;
+        }
+        if (!above.geometry.roundedCornersRadii.isEmpty() || above.shadow.length > 0.f) {
+            continue;
+        }
+        if (!(above.colorTransform == android::mat4()) ||
+            !(above.geometry.positionTransform == layer.geometry.positionTransform)) {
+            continue;
+        }
+        const auto& crop = above.geometry.roundedCornersCrop;
+        if (covers(above.geometry.boundaries, b) && (crop.isEmpty() || covers(crop, b))) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static inline bool layerSamplesBehind(const android::renderengine::LayerSettings& layer,
                                       bool colorTransformModifiesAlpha) {
     if (layer.backgroundBlurRadius > 0 || layer.blurRegions.size() ||
@@ -371,6 +415,8 @@ SkiaRenderEngine::~SkiaRenderEngine() { }
 // destroyed by subclasses.
 void SkiaRenderEngine::finishRenderingAndAbandonContexts() {
     std::lock_guard<std::mutex> lock(mRenderingMutex);
+
+    mBlurCache.clear();
 
     if (mBlurFilter) {
         delete mBlurFilter;
@@ -1108,7 +1154,8 @@ void SkiaRenderEngine::drawLayersInternal(
         const auto [bounds, roundRectClip] =
                 getBoundsAndClip(layer.geometry.boundaries, layer.geometry.roundedCornersCrop,
                                  layer.geometry.roundedCornersRadii);
-        if (mBlurFilter && layerSamplesBehind(layer, ctModifiesAlpha)) {
+        if (mBlurFilter && layerSamplesBehind(layer, ctModifiesAlpha) &&
+            !isBlurOccludedByOpaqueLayer(layer, layers, ctModifiesAlpha)) {
             // rect to be blurred in the coordinate space of blurInput
             SkRect blurRect = canvas->getTotalMatrix().mapRect(bounds.rect());
 
@@ -1171,17 +1218,149 @@ void SkiaRenderEngine::drawLayersInternal(
                                                                blurRect);
                 };
 
+                // Hash of every input to the blur: the content below the layer, and the blur state
+                // of every layer, since stacked occlusion reads the layers above. Uncacheable if a
+                // buffer below has no frame number.
+                auto computeBlurInputHash = [&]() -> std::pair<bool, uint64_t> {
+                    uint64_t h = 14695981039346656037ULL;
+                    const auto mix = [&h](uint64_t v) {
+                        h ^= v;
+                        h *= 1099511628211ULL;
+                    };
+                    const auto mixFloat = [&mix](float f) {
+                        uint32_t bits;
+                        std::memcpy(&bits, &f, sizeof(f));
+                        mix(bits);
+                    };
+                    mix(static_cast<uint32_t>(display.outputDataspace));
+                    mixFloat(display.maxLuminance);
+                    for (int r = 0; r < 4; ++r) {
+                        for (int c = 0; c < 4; ++c) {
+                            mixFloat(float(display.colorTransform[r][c]));
+                        }
+                    }
+                    for (const auto& l : layers) {
+                        if (&l == &layer) continue;
+                        if (&l < &layer) {
+                            if (l.source.buffer.buffer) {
+                                if (l.source.buffer.frameNumber == 0) {
+                                    return {false, 0};
+                                }
+                                mix(l.source.buffer.buffer->getId());
+                                mix(l.source.buffer.frameNumber);
+                            }
+                            mixFloat(float(l.source.solidColor.r));
+                            mixFloat(float(l.source.solidColor.g));
+                            mixFloat(float(l.source.solidColor.b));
+                            mix(static_cast<uint32_t>(l.source.buffer.isOpaque));
+                            mix(static_cast<uint32_t>(l.sourceDataspace));
+                            for (int r = 0; r < 4; ++r) {
+                                for (int c = 0; c < 4; ++c) {
+                                    mixFloat(float(l.colorTransform[r][c]));
+                                }
+                            }
+                        }
+                        mixFloat(float(l.alpha));
+                        mix(static_cast<uint32_t>(l.backgroundBlurRadius));
+                        mixFloat(l.backgroundBlurScale);
+                        mix(static_cast<uint32_t>(l.skipContentDraw));
+                        mix(static_cast<uint32_t>(l.geometry.roundedCornersRadii.isEmpty()));
+                        mixFloat(l.shadow.length);
+                        for (int r = 0; r < 4; ++r) {
+                            for (int c = 0; c < 4; ++c) {
+                                mixFloat(float(l.geometry.positionTransform[r][c]));
+                            }
+                        }
+                        mixFloat(l.geometry.boundaries.left);
+                        mixFloat(l.geometry.boundaries.top);
+                        mixFloat(l.geometry.boundaries.right);
+                        mixFloat(l.geometry.boundaries.bottom);
+                        mix(static_cast<uint64_t>(l.blurRegions.size()));
+                        for (const BlurRegion& region : l.blurRegions) {
+                            mix(region.blurRadius);
+                            mixFloat(region.cornerRadiusTLX);
+                            mixFloat(region.cornerRadiusTLY);
+                            mixFloat(region.cornerRadiusTRX);
+                            mixFloat(region.cornerRadiusTRY);
+                            mixFloat(region.cornerRadiusBLX);
+                            mixFloat(region.cornerRadiusBLY);
+                            mixFloat(region.cornerRadiusBRX);
+                            mixFloat(region.cornerRadiusBRY);
+                            mixFloat(region.alpha);
+                            mix(static_cast<uint32_t>(region.left));
+                            mix(static_cast<uint32_t>(region.top));
+                            mix(static_cast<uint32_t>(region.right));
+                            mix(static_cast<uint32_t>(region.bottom));
+                        }
+                    }
+                    return {true, h};
+                };
+
+                auto lookupBlurCache = [&](uint32_t radius, const SkIRect& rect,
+                                           uint64_t inputHash) -> sk_sp<SkImage> {
+                    for (auto it = mBlurCache.begin(); it != mBlurCache.end(); ++it) {
+                        if (it->blurRadius == radius && it->inputHash == inputHash &&
+                            it->blurRect == rect) {
+                            sk_sp<SkImage> img = it->image;
+                            if (it != mBlurCache.begin()) {
+                                BlurCacheEntry entry = std::move(*it);
+                                mBlurCache.erase(it);
+                                mBlurCache.push_front(std::move(entry));
+                            }
+                            return img;
+                        }
+                    }
+                    return nullptr;
+                };
+
+                auto storeBlurCache = [&](sk_sp<SkImage> image, uint32_t radius,
+                                          const SkIRect& rect, uint64_t inputHash) {
+                    // The cache keeps its own copy. A reference to a pooled or shared surface would
+                    // be copied on every write to that surface while the entry lives. One copy per
+                    // miss is cheaper.
+                    if (context) {
+                        if (sk_sp<SkSurface> owned = context->createRenderTarget(image->imageInfo())) {
+                            owned->getCanvas()->drawImage(image, 0, 0);
+                            image = owned->makeImageSnapshot();
+                        }
+                    }
+                    mBlurCache.push_front({std::move(image), inputHash, radius, rect});
+                    if (mBlurCache.size() > kBlurCacheMaxEntries) {
+                        mBlurCache.pop_back();
+                    }
+                };
+
+                const SkIRect blurRectI = blurRect.roundOut();
+                const auto [cacheableBlurInput, blurInputHash] = computeBlurInputHash();
+
+                // A cached result is used when every input matches. Otherwise the blur is generated
+                // and stored.
+                auto blurWithCache = [&](uint32_t radius) -> sk_sp<SkImage> {
+                    if (cacheableBlurInput) {
+                        if (sk_sp<SkImage> cached = lookupBlurCache(radius, blurRectI, blurInputHash)) {
+                            return cached;
+                        }
+                    }
+                    sk_sp<SkImage> result = generateBlur(radius);
+                    if (result && cacheableBlurInput) {
+                        storeBlurCache(result, radius, blurRectI, blurInputHash);
+                    }
+                    return result;
+                };
+
                 sk_sp<SkImage> temporaryBlurredImage = nullptr; // Might be reused by blur regions.
                 if (layer.backgroundBlurRadius > 0) {
                     SFTRACE_NAME("BackgroundBlur");
                     // Result is only valid until the next call to generateTemporaryImage (for a
                     // given BlurFilter). Safe to invalidate after all desired drawBlurRegion
                     // invocations have been made for a particular blurred SkImage.
-                    temporaryBlurredImage = generateBlur(layer.backgroundBlurRadius);
+                    temporaryBlurredImage = blurWithCache(layer.backgroundBlurRadius);
 
-                    mBlurFilter->drawBlurRegion(canvas, bounds, layer.backgroundBlurRadius,
-                                                layer.backgroundBlurScale, 1.0f, blurRect,
-                                                temporaryBlurredImage, blurInput);
+                    if (temporaryBlurredImage) {
+                        mBlurFilter->drawBlurRegion(canvas, bounds, layer.backgroundBlurRadius,
+                                                    layer.backgroundBlurScale, 1.0f, blurRect,
+                                                    temporaryBlurredImage, blurInput);
+                    }
                 }
 
                 if (layer.blurRegions.size()) {
@@ -1227,7 +1406,10 @@ void SkiaRenderEngine::drawLayersInternal(
                     for (const auto& [radius, regions] : regionsPerRadius) {
                         {
                             SFTRACE_NAME("BlurRegion");
-                            temporaryBlurredImage = generateBlur(radius);
+                            temporaryBlurredImage = blurWithCache(radius);
+                        }
+                        if (!temporaryBlurredImage) {
+                            continue;
                         }
                         for (const BlurRegion& region : regions) {
                             drawRegion(temporaryBlurredImage, region);
@@ -1783,6 +1965,11 @@ void SkiaRenderEngine::drawShadow(SkCanvas* canvas,
 }
 
 void SkiaRenderEngine::onActiveDisplaySizeChanged(ui::Size size) {
+    {
+        std::lock_guard<std::mutex> lock(mRenderingMutex);
+        mBlurCache.clear();
+    }
+
     // This cache multiplier was selected based on review of cache sizes relative
     // to the screen resolution. Looking at the worst case memory needed by blur (~1.5x),
     // shadows (~1x), and general data structures (e.g. vertex buffers) we selected this as a
