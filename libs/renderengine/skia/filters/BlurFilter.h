@@ -18,7 +18,9 @@
 
 #include <SkCanvas.h>
 #include <SkImage.h>
+#include <SkMatrix.h>
 #include <SkRuntimeEffect.h>
+#include <SkShader.h>
 #include <SkSurface.h>
 
 #include "../compat/SkiaGpuContext.h"
@@ -70,6 +72,11 @@ public:
     virtual bool areBuffersPreallocated(const SkiaGpuContext* context, ui::Size displaySize) const {
         return true;
     }
+
+protected:
+    virtual sk_sp<SkShader> makeBlurShader(const sk_sp<SkImage>& blurredImage,
+                                           const SkMatrix& blurMatrix,
+                                           const SkRect& blurRect) const;
 
 private:
     // To avoid downscaling artifacts, we interpolate the blurred fbo with the full composited
