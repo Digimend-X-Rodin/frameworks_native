@@ -191,7 +191,14 @@ void KawaseBlurDualFilterV2::blurInto(const sk_sp<SkSurface>& drawSurface, sk_sp
         paint.setShader(blurBuilder.makeShader(nullptr));
     }
     paint.setBlendMode(alpha == 1.0f ? SkBlendMode::kSrc : SkBlendMode::kSrcOver);
-    drawSurface->getCanvas()->drawPaint(paint);
+    SkCanvas* canvas = drawSurface->getCanvas();
+    if (alpha == 1.0f && !inputEdgesNeedClamp) {
+        // The kSrc draw covers an exact-size target completely, so the old contents are not needed.
+        // inputEdgesNeedClamp is set for preallocated targets, which are larger than their content and
+        // whose padding the sampler reads. Those keep their contents.
+        canvas->discard();
+    }
+    canvas->drawPaint(paint);
 }
 
 sk_sp<SkImage> KawaseBlurDualFilterV2::generateTemporaryImage(SkiaGpuContext* context,
